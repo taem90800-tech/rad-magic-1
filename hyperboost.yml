@@ -1,0 +1,158 @@
+name: Build Game Space APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Create Android project from index.html
+        run: |
+          npm init -y
+          npm i @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          mkdir -p www
+          cp index.html www/index.html
+          npx cap init "Game Space" com.hyperboost.gamespace --web-dir www
+          npx cap add android
+          PKG=android/app/src/main/java/com/hyperboost/gamespace
+          mkdir -p "$PKG"
+          cat > "$PKG/MainActivity.java" <<'EOF'
+          package com.hyperboost.gamespace;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+            @Override
+            public void onCreate(Bundle savedInstanceState) {
+              registerPlugin(GameLauncherPlugin.class);
+              super.onCreate(savedInstanceState);
+            }
+          }
+          EOF
+          cat > "$PKG/GameLauncherPlugin.java" <<'EOF'
+          package com.hyperboost.gamespace;
+
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.pm.ApplicationInfo;
+          import android.content.pm.PackageManager;
+          import android.content.pm.ResolveInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.drawable.Drawable;
+          import android.os.Build;
+          import android.util.Base64;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.io.ByteArrayOutputStream;
+          import java.util.HashSet;
+          import java.util.List;
+
+          @CapacitorPlugin(name = "GameLauncher")
+          public class GameLauncherPlugin extends Plugin {
+
+            private String icon(Drawable d) {
+              try {
+                Bitmap b = Bitmap.createBitmap(72, 72, Bitmap.Config.ARGB_8888);
+                Canvas c = new Canvas(b);
+                d.setBounds(0, 0, 72, 72);
+                d.draw(c);
+                ByteArrayOutputStream o = new ByteArrayOutputStream();
+                b.compress(Bitmap.CompressFormat.PNG, 100, o);
+                return Base64.encodeToString(o.toByteArray(), Base64.NO_WRAP);
+              } catch (Exception e) {
+                return "";
+              }
+            }
+
+            @PluginMethod
+            public void getApps(PluginCall call) {
+              Context ctx = getContext();
+              PackageManager pm = ctx.getPackageManager();
+              Intent q = new Intent(Intent.ACTION_MAIN, null);
+              q.addCategory(Intent.CATEGORY_LAUNCHER);
+              List<ResolveInfo> list = pm.queryIntentActivities(q, 0);
+              HashSet<String> seen = new HashSet<>();
+              JSArray arr = new JSArray();
+              for (ResolveInfo ri : list) {
+                String pkg = ri.activityInfo.packageName;
+                if (pkg.equals(ctx.getPackageName()) || !seen.add(pkg)) continue;
+                boolean game = false;
+                try {
+                  ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+                  if (Build.VERSION.SDK_INT >= 26 && ai.category == ApplicationInfo.CATEGORY_GAME) game = true;
+                  if ((ai.flags & ApplicationInfo.FLAG_IS_GAME) != 0) game = true;
+                } catch (Exception e) {
+                }
+                JSObject o = new JSObject();
+                o.put("name", String.valueOf(ri.loadLabel(pm)));
+                o.put("pkg", pkg);
+                o.put("game", game);
+                o.put("icon", icon(ri.loadIcon(pm)));
+                arr.put(o);
+              }
+              JSObject res = new JSObject();
+              res.put("apps", arr);
+              call.resolve(res);
+            }
+
+            @PluginMethod
+            public void launch(PluginCall call) {
+              String pkg = call.getString("pkg");
+              Intent i = pkg == null ? null : getContext().getPackageManager().getLaunchIntentForPackage(pkg);
+              if (i == null) {
+                call.reject("not found");
+                return;
+              }
+              i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+              getContext().startActivity(i);
+              call.resolve();
+            }
+          }
+          EOF
+          sed -i 's#<application#<queries><intent><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent></queries><application#' android/app/src/main/AndroidManifest.xml
+          npx cap sync android
+
+      - name: Build APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Save APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Game-Space-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publish APK to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Game Space build ${{ github.run_number }}
+          files: android/app/build/outputs/apk/debug/app-debug.apk
